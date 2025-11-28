@@ -1,0 +1,31 @@
+# Jarvis Voice Assistant - Python Dependencies
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+websockets>=10.4
+
+# OpenAI APIs
+openai==1.12.0
+
+# HTTP Client
+httpx==0.26.0
+aiohttp==3.9.3
+
+# Environment & Configuration
+python-dotenv==1.0.1
+pydantic==2.6.0
+pydantic-settings==2.1.0
+
+# Async Support
+asyncio-throttle==1.0.2
+
+# Logging
+loguru==0.7.2
+
+# GitHub Integration
+PyGithub==2.1.1
+
+# Utilities
+python-dateutil==2.8.2
