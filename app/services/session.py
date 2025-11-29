@@ -21,9 +21,12 @@ class SessionManager:
         self._sessions: Dict[str, dict] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
     
-    def create_session(self) -> str:
+    def create_session(self, user_id: Optional[str] = None) -> str:
         """
         Create a new session.
+        
+        Args:
+            user_id: Optional user ID. If not provided, uses default_user_id from settings.
         
         Returns:
             The new session ID
@@ -31,14 +34,19 @@ class SessionManager:
         session_id = str(uuid.uuid4())
         now = datetime.utcnow()
         
+        # Use default user if not provided (for now, single user mode)
+        if user_id is None:
+            user_id = settings.default_user_id
+        
         self._sessions[session_id] = {
             "id": session_id,
+            "user_id": user_id,
             "created_at": now,
             "expires_at": now + timedelta(minutes=settings.session_expiry_minutes),
             "last_activity": now,
         }
         
-        logger.debug(f"Created session: {session_id}")
+        logger.debug(f"Created session: {session_id} for user: {user_id}")
         return session_id
     
     def get_session(self, session_id: str) -> Optional[dict]:
@@ -61,12 +69,13 @@ class SessionManager:
         
         return None
     
-    def get_or_create_session(self, session_id: Optional[str]) -> dict:
+    def get_or_create_session(self, session_id: Optional[str], user_id: Optional[str] = None) -> dict:
         """
         Get an existing session or create a new one.
         
         Args:
             session_id: Optional session ID to retrieve
+            user_id: Optional user ID for new sessions
             
         Returns:
             Session data
@@ -77,7 +86,7 @@ class SessionManager:
                 self._update_activity(session_id)
                 return session
         
-        new_session_id = self.create_session()
+        new_session_id = self.create_session(user_id=user_id)
         return self._sessions[new_session_id]
     
     def extend_session(self, session_id: str) -> bool:

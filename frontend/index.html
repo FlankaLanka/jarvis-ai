@@ -87,6 +87,25 @@
             max-width: 80%;
         }
         
+        .chat-message-system {
+            background: #1a2a1a;
+            border: 1px solid #2a4a2a;
+            align-self: center;
+            max-width: 90%;
+            font-size: 0.85rem;
+            opacity: 0.8;
+        }
+        
+        .chat-message-system[data-category="vectordb"] {
+            background: #1a1a3a;
+            border-color: #2a2a5a;
+        }
+        
+        .chat-message-system[data-category="github"] {
+            background: #2a1a1a;
+            border-color: #4a2a2a;
+        }
+        
         .chat-role {
             font-size: 0.75rem;
             font-weight: 600;
@@ -241,6 +260,47 @@
             font-size: 0.85rem;
         }
         
+        /* Model Selection */
+        .model-selector {
+            margin-top: 2rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .model-selector label {
+            font-size: 0.85rem;
+            color: #888;
+        }
+        
+        .model-selector select {
+            background: #1a1a2e;
+            border: 1px solid #333;
+            border-radius: 6px;
+            color: #e0e0e0;
+            padding: 0.5rem 1rem;
+            font-size: 0.9rem;
+            cursor: pointer;
+            outline: none;
+            transition: all 0.2s ease;
+            min-width: 200px;
+        }
+        
+        .model-selector select:hover {
+            border-color: #4a9eff;
+        }
+        
+        .model-selector select:focus {
+            border-color: #4a9eff;
+            box-shadow: 0 0 10px rgba(74, 158, 255, 0.2);
+        }
+        
+        .model-selector select option {
+            background: #1a1a2e;
+            color: #e0e0e0;
+        }
+        
         /* Hidden elements */
         .visually-hidden {
             position: absolute;
@@ -268,6 +328,16 @@
             </button>
             
             <p id="status" class="status">Ready</p>
+            
+            <div class="model-selector">
+                <label for="model-select">GPT Model:</label>
+                <select id="model-select">
+                    <option value="gpt-4">GPT-4 (Best Quality)</option>
+                    <option value="gpt-4-turbo">GPT-4 Turbo (Balanced)</option>
+                    <option value="gpt-3.5-turbo" selected>GPT-3.5 Turbo (Fastest)</option>
+                    <option value="gpt-4o">GPT-4o (Latest)</option>
+                </select>
+            </div>
             
             <div class="instructions">
                 <p>Hold the button and speak, or press and release to toggle.</p>

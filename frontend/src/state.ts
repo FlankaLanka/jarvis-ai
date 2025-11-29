@@ -52,9 +52,18 @@ class StateManager {
     const oldState = this._state;
     this._state = newState;
 
-    // Play audio cue for state transition
-    if (this._audioFeedbackEnabled) {
-      this._playStateCue(newState);
+    // Play audio cue for state transition (only if transitioning TO this state)
+    // Continuous indicators are handled separately in main.ts
+    if (this._audioFeedbackEnabled && oldState !== newState) {
+      // Only play initial cue, not continuous indicators
+      // Continuous indicators are started/stopped in main.ts handlers
+      if (newState === 'listening' || newState === 'thinking') {
+        // Initial cue will be played, but continuous indicator is handled separately
+        this._playStateCue(newState);
+      } else {
+        // For other states, play cue immediately
+        this._playStateCue(newState);
+      }
     }
 
     // Notify listeners

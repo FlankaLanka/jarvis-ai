@@ -61,10 +61,15 @@ class WebSocketClient {
           console.log('WebSocket connected');
           this._reconnectAttempts = 0;
 
-          // Send session initialization
+          // Get selected model from UI
+          const modelSelect = document.getElementById('model-select') as HTMLSelectElement;
+          const selectedModel = modelSelect?.value || 'gpt-3.5-turbo';
+
+          // Send session initialization with model preference
           this._ws!.send(JSON.stringify({
             type: 'init',
             session_id: sessionId || null,
+            model: selectedModel,
           }));
 
           this._connectHandlers.forEach(h => h());

@@ -17,6 +17,7 @@ from loguru import logger
 from app.api.router import api_router
 from app.config import settings
 from app.services.session import session_manager
+from app.integrations.api_connector import api_connector
 
 
 @asynccontextmanager
@@ -27,12 +28,16 @@ async def lifespan(app: FastAPI):
     
     # Start background tasks
     session_manager.start_cleanup_task()
+    api_connector.start_refresh_scheduler()
+    logger.info(f"API auto-refresh enabled (every {settings.api_refresh_interval_seconds}s)")
     
     yield
     
     # Cleanup
     logger.info("Shutting down Jarvis Voice Assistant...")
     session_manager.stop_cleanup_task()
+    api_connector.stop_refresh_scheduler()
+    await api_connector.close()
 
 
 # Create FastAPI application

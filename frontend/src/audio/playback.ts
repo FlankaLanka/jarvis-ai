@@ -16,9 +16,14 @@ class AudioPlayback {
   private _volume: number = 1.0;
   private _gainNode: GainNode | null = null;
   private _bufferTimeout: number | null = null;
+  private _allAudioReceived: boolean = false; // Track if all audio has been received
 
   get isPlaying(): boolean {
     return this._isPlaying;
+  }
+  
+  get queueLength(): number {
+    return this._audioQueue.length;
   }
 
   /**
@@ -94,6 +99,7 @@ class AudioPlayback {
       source.onended = () => {
         this._isPlaying = false;
         this._currentSource = null;
+        // Don't call onEndCallback here - let _playNext handle it when queue is empty
         this._playNext();
       };
 
@@ -117,14 +123,30 @@ class AudioPlayback {
   }
 
   /**
-   * Add audio to queue.
-   * For MP3, we need to buffer chunks and combine them before decoding.
+   * Add complete audio to queue.
+   * Each audio segment is a complete sentence that can be played immediately.
    */
   queue(audioData: ArrayBuffer): void {
+    console.log('Queueing complete audio segment:', audioData.byteLength, 'bytes');
+    
+    // Add to queue
+    this._audioQueue.push(audioData);
+    
+    // If not currently playing, start playback
+    if (!this._isPlaying) {
+      this._playNext();
+    }
+  }
+  
+  /**
+   * Legacy method: Add audio chunk to buffer (for streaming).
+   * For MP3, we need to buffer chunks and combine them before decoding.
+   */
+  queueChunk(audioData: ArrayBuffer): void {
     console.log('Queueing audio chunk:', audioData.byteLength, 'bytes');
     
     // Start buffering if not already
-    if (!this._isBuffering && !this._isPlaying) {
+    if (!this._isBuffering) {
       this._isBuffering = true;
       this._audioBuffer = new Uint8Array(0);
     }
@@ -173,15 +195,37 @@ class AudioPlayback {
    */
   private async _playNext(): Promise<void> {
     if (this._audioQueue.length === 0) {
-      // Queue empty, notify end
-      if (this._onEndCallback) {
+      // Queue empty
+      // Only notify end if all audio has been received
+      if (this._allAudioReceived && this._onEndCallback) {
+        console.log('All audio played, notifying end');
+        this._allAudioReceived = false; // Reset for next use
         this._onEndCallback();
       }
       return;
     }
 
     const nextAudio = this._audioQueue.shift()!;
+    console.log('Playing next audio from queue, remaining:', this._audioQueue.length);
     await this.play(nextAudio);
+  }
+  
+  /**
+   * Mark that all audio has been received from server.
+   * When queue becomes empty after this, onEnd callback will be called.
+   */
+  markAllReceived(): void {
+    console.log('All audio received, queue length:', this._audioQueue.length, 'isPlaying:', this._isPlaying);
+    this._allAudioReceived = true;
+    
+    // If not playing and queue is empty, notify end immediately
+    if (!this._isPlaying && this._audioQueue.length === 0) {
+      if (this._onEndCallback) {
+        console.log('No audio to play, notifying end immediately');
+        this._allAudioReceived = false;
+        this._onEndCallback();
+      }
+    }
   }
 
   /**
@@ -207,6 +251,7 @@ class AudioPlayback {
     this._audioQueue = [];
     this._audioBuffer = null;
     this._isBuffering = false;
+    this._allAudioReceived = false;
     if (this._bufferTimeout) {
       clearTimeout(this._bufferTimeout);
       this._bufferTimeout = null;

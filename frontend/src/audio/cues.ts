@@ -54,19 +54,61 @@ class AudioCues {
   }
 
   /**
-   * Play "listening" cue - brief ascending tone.
+   * Play "listening" cue - brief ascending tone with confirmation.
    */
   playListening(): void {
     if (!this._enabled) return;
-    this._playTone([330, 440], 0.1, 'sine');
+    // More noticeable ascending tone to indicate microphone is active
+    this._playTone([440, 550, 660], 0.15, 'sine');
   }
 
   /**
-   * Play "thinking/processing" cue - subtle chime.
+   * Play "thinking/processing" cue - more noticeable chime.
    */
   playThinking(): void {
     if (!this._enabled) return;
-    this._playChime([523, 659], 0.15);
+    // More noticeable chime to indicate AI is processing
+    this._playChime([523, 659, 784], 0.2);
+  }
+  
+  /**
+   * Start continuous listening indicator - subtle periodic beeps.
+   */
+  startListeningIndicator(intervalMs: number = 1500): () => void {
+    if (!this._enabled) return () => {};
+    
+    // Play initial cue
+    this.playListening();
+    
+    // Then play periodic subtle beeps
+    const interval = setInterval(() => {
+      if (this._enabled) {
+        // Subtle beep to indicate still listening
+        this._playTone([440], 0.05, 'sine');
+      }
+    }, intervalMs);
+    
+    return () => clearInterval(interval);
+  }
+  
+  /**
+   * Start continuous thinking indicator - periodic chimes.
+   */
+  startThinkingIndicator(intervalMs: number = 2000): () => void {
+    if (!this._enabled) return () => {};
+    
+    // Play initial cue
+    this.playThinking();
+    
+    // Then play periodic chimes
+    const interval = setInterval(() => {
+      if (this._enabled) {
+        // Subtle thinking chime
+        this._playChime([523, 659], 0.1);
+      }
+    }, intervalMs);
+    
+    return () => clearInterval(interval);
   }
 
   /**
