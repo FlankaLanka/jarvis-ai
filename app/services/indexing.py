@@ -182,6 +182,9 @@ Topics:"""
                 metadata["user_id"] = user_id
             
             # Index the summary
+            logger.info(f"Calling vectordb_service.add_document for summary {doc_id}")
+            logger.info(f"Summary length: {len(summary)} chars, metadata: {metadata}")
+            
             success = await vectordb_service.add_document(
                 collection=CONVERSATION_SUMMARIES,
                 doc_id=doc_id,
@@ -190,9 +193,9 @@ Topics:"""
             )
             
             if success:
-                logger.info(f"Indexed conversation summary {doc_id} with {len(history)} exchanges (user_id: {user_id})")
+                logger.info(f"✅ Indexed conversation summary {doc_id} with {len(history)} exchanges (user_id: {user_id})")
             else:
-                logger.warning(f"Failed to index conversation summary {doc_id}")
+                logger.error(f"❌ Failed to index conversation summary {doc_id} - vectordb_service.add_document returned False")
             
             return success
             

@@ -136,6 +136,166 @@ class MemoryService:
         history = self.get_history(session_id)
         return history[-1] if history else None
     
+    async def save_exchange_to_vectordb(
+        self,
+        session_id: str,
+        exchange: dict,
+        user_id: Optional[str] = None
+    ) -> bool:
+        """
+        Save a single exchange as an individual document to vector DB.
+        
+        Args:
+            session_id: Session ID
+            exchange: Exchange dictionary
+            user_id: Optional user ID
+            
+        Returns:
+            True if successful
+        """
+        if not exchange:
+            return False
+        
+        try:
+            # Format exchange content
+            user_msg = exchange.get("user", "")
+            assistant_msg = exchange.get("assistant", "")
+            
+            content_parts = [f"User: {user_msg}", f"Assistant: {assistant_msg}"]
+            
+            if exchange.get("tool_calls"):
+                tool_info = ", ".join([
+                    f"{tc.get('name', 'unknown')}({tc.get('arguments', {})})" 
+                    for tc in exchange.get("tool_calls", [])
+                ])
+                content_parts.append(f"Actions: {tool_info}")
+            
+            if exchange.get("tool_results"):
+                results_info = ", ".join([
+                    f"{tr.get('name', 'unknown')}: {'✓' if tr.get('success') else '✗'}" 
+                    for tr in exchange.get("tool_results", [])
+                ])
+                content_parts.append(f"Results: {results_info}")
+            
+            content = "\n".join(content_parts)
+            
+            # Generate document ID
+            import hashlib
+            timestamp = exchange.get("timestamp", datetime.utcnow().isoformat())
+            combined = f"exchange_{session_id}_{timestamp}"
+            hash_suffix = hashlib.md5(combined.encode()).hexdigest()[:8]
+            doc_id = f"exchange_{hash_suffix}"
+            
+            # Prepare metadata
+            metadata = {
+                "session_id": session_id,
+                "timestamp": timestamp,
+                "type": "conversation_exchange",
+                "has_tools": bool(exchange.get("tool_calls")),
+                "exchange_index": len(self.get_history(session_id))  # Position in conversation
+            }
+            
+            if user_id:
+                metadata["user_id"] = user_id
+            
+            # Save to vector DB
+            success = await self.vectordb.add_document(
+                collection="conversation_summaries",  # Same collection, different type
+                doc_id=doc_id,
+                content=content,
+                metadata=metadata
+            )
+            
+            if success:
+                logger.debug(f"Saved individual exchange {doc_id} to vector DB")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error saving exchange to vector DB: {e}", exc_info=True)
+            return False
+    
+    async def rotate_exchanges(
+        self,
+        session_id: str,
+        user_id: Optional[str] = None,
+        keep_recent: int = 10
+    ) -> bool:
+        """
+        Rotate exchanges: keep N most recent as individual documents, summarize older ones.
+        
+        This method:
+        1. Keeps the last N exchanges as individual documents
+        2. Summarizes exchanges beyond N and stores as summary
+        3. Optionally removes old individual exchange documents (to avoid duplicates)
+        
+        Args:
+            session_id: Session ID
+            user_id: Optional user ID
+            keep_recent: Number of recent exchanges to keep individually (default: 10)
+            
+        Returns:
+            True if rotation completed successfully
+        """
+        history = self.get_history(session_id)
+        
+        if len(history) <= keep_recent:
+            # Not enough exchanges to rotate
+            return True
+        
+        try:
+            # Split into recent (keep) and old (summarize)
+            recent_exchanges = history[-keep_recent:]
+            old_exchanges = history[:-keep_recent]
+            
+            if not old_exchanges:
+                return True
+            
+            logger.info(f"Rotating exchanges: keeping {len(recent_exchanges)} recent, summarizing {len(old_exchanges)} old")
+            
+            # Summarize old exchanges
+            summary = await self.indexing.generate_conversation_summary(old_exchanges, session_id)
+            
+            if summary:
+                # Extract topics
+                topics = await self.indexing.extract_topics(summary)
+                
+                # Generate document ID for summary
+                timestamp = datetime.utcnow().isoformat()
+                doc_id = self.indexing._generate_doc_id("summary", session_id, timestamp)
+                
+                # Prepare metadata
+                metadata = {
+                    "session_id": session_id,
+                    "exchanges_count": len(old_exchanges),
+                    "topics": topics,
+                    "timestamp": timestamp,
+                    "type": "conversation_summary",
+                    "rotated_from": "individual_exchanges"
+                }
+                
+                if user_id:
+                    metadata["user_id"] = user_id
+                
+                # Save summary
+                success = await self.vectordb.add_document(
+                    collection="conversation_summaries",
+                    doc_id=doc_id,
+                    content=summary,
+                    metadata=metadata
+                )
+                
+                if success:
+                    logger.info(f"✅ Rotated {len(old_exchanges)} exchanges into summary {doc_id}")
+                
+                return success
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error rotating exchanges: {e}", exc_info=True)
+            return False
+    
     def get_summary(self, session_id: str, max_exchanges: int = 5) -> str:
         """
         Get a summary of recent conversation for context.
@@ -195,6 +355,9 @@ class MemoryService:
             return False
         
         try:
+            logger.info(f"Attempting to save conversation summary: session={session_id}, user_id={user_id}, exchanges={len(history)}")
+            logger.info(f"Vector DB available: {self.vectordb.is_available}")
+            
             success = await self.indexing.index_conversation_summary(
                 session_id=session_id,
                 history=history,
@@ -202,14 +365,14 @@ class MemoryService:
             )
             
             if success:
-                logger.info(f"Saved conversation summary to vector DB for session {session_id} (user_id: {user_id}, exchanges: {len(history)})")
+                logger.info(f"✅ Saved conversation summary to vector DB for session {session_id} (user_id: {user_id}, exchanges: {len(history)})")
             else:
-                logger.warning(f"Failed to save conversation summary for session {session_id} (user_id: {user_id})")
+                logger.warning(f"❌ Failed to save conversation summary for session {session_id} (user_id: {user_id})")
             
             return success
             
         except Exception as e:
-            logger.error(f"Error saving to vector DB: {e}", exc_info=True)
+            logger.error(f"❌ Error saving to vector DB: {e}", exc_info=True)
             return False
     
     async def search_relevant_memories(
@@ -253,7 +416,8 @@ class MemoryService:
                     "score": result.score,
                     "timestamp": result.metadata.get("timestamp"),
                     "topics": result.metadata.get("topics", []),
-                    "session_id": result.metadata.get("session_id")
+                    "session_id": result.metadata.get("session_id"),
+                    "metadata": result.metadata  # Include full metadata for filtering
                 })
             
             logger.info(f"Found {len(memories)} relevant memories for query '{query}' (user_id: {user_id})")
@@ -309,7 +473,8 @@ class MemoryService:
                     "path": result.metadata.get("path"),
                     "repo": result.metadata.get("repo"),
                     "content_type": result.metadata.get("content_type"),
-                    "language": result.metadata.get("language")
+                    "language": result.metadata.get("language"),
+                    "indexed_at": result.metadata.get("indexed_at")  # For freshness checking
                 })
             
             logger.debug(f"Found {len(content_results)} relevant content results")
@@ -319,19 +484,68 @@ class MemoryService:
             logger.error(f"Error searching indexed content: {e}")
             return []
     
+    async def get_recent_exchanges_from_vectordb(
+        self,
+        session_id: str,
+        user_id: Optional[str] = None,
+        limit: int = 10
+    ) -> List[dict]:
+        """
+        Get the N most recent individual exchanges from vector DB for a session.
+        
+        Args:
+            session_id: Session ID
+            user_id: Optional user ID for filtering
+            limit: Number of recent exchanges to retrieve (default: 10)
+            
+        Returns:
+            List of recent exchange documents
+        """
+        try:
+            # List all documents in the collection and filter
+            all_docs = await self.vectordb.list_documents("conversation_summaries", limit=1000)
+            
+            # Filter to exchanges for this session
+            exchanges = []
+            for doc in all_docs:
+                metadata = doc.get("metadata", {})
+                if (metadata.get("type") == "conversation_exchange" and 
+                    metadata.get("session_id") == session_id):
+                    if not user_id or metadata.get("user_id") == user_id:
+                        exchanges.append({
+                            "content": doc.get("content", ""),
+                            "timestamp": metadata.get("timestamp", ""),
+                            "metadata": metadata
+                        })
+            
+            # Sort by timestamp (most recent first)
+            exchanges.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+            
+            # Return top N
+            recent = exchanges[:limit]
+            logger.debug(f"Retrieved {len(recent)} recent exchanges from vector DB (session: {session_id})")
+            return recent
+            
+        except Exception as e:
+            logger.error(f"Error getting recent exchanges from vector DB: {e}", exc_info=True)
+            return []
+    
     async def get_combined_context(
         self,
         query: str,
         session_id: str,
         include_memories: bool = True,
         include_indexed_content: bool = True,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        include_recent_exchanges: bool = True
     ) -> Optional[str]:
         """
-        Get combined context from current history, past memories, and indexed content.
+        Get combined context from recent exchanges, past memories, and indexed content.
         
-        This method searches both conversation summaries and indexed content,
-        combining the results into a formatted context string for the LLM.
+        This method:
+        1. Gets the 10 most recent exchanges from vector DB
+        2. Searches past conversation summaries
+        3. Searches indexed content
         
         Args:
             query: The user's query
@@ -339,13 +553,30 @@ class MemoryService:
             include_memories: Whether to search past conversation summaries
             include_indexed_content: Whether to search indexed content
             user_id: Optional user ID for filtering memories
+            include_recent_exchanges: Whether to include recent individual exchanges (default: True)
             
         Returns:
             Formatted context string or None if no context found
         """
         context_parts = []
         
-        # Search past memories
+        # Get recent exchanges from vector DB (always include these for context)
+        if include_recent_exchanges:
+            try:
+                recent_exchanges = await self.get_recent_exchanges_from_vectordb(
+                    session_id=session_id,
+                    user_id=user_id,
+                    limit=10
+                )
+                if recent_exchanges:
+                    context_parts.append("=== Recent Exchanges (Most Recent 10) ===")
+                    for i, exchange in enumerate(recent_exchanges, 1):
+                        context_parts.append(f"[Exchange {i}] {exchange['content']}")
+                    logger.debug(f"Included {len(recent_exchanges)} recent exchanges in context")
+            except Exception as e:
+                logger.warning(f"Error getting recent exchanges: {e}")
+        
+        # Search past memories (summaries)
         if include_memories:
             logger.debug(f"Searching memories for query: '{query}' with user_id: {user_id}")
             memories = await self.search_relevant_memories(
@@ -356,13 +587,15 @@ class MemoryService:
             logger.debug(f"Found {len(memories)} memories for query")
             
             if memories:
-                context_parts.append("=== Relevant Past Conversations ===")
+                context_parts.append("\n=== Relevant Past Conversations (Summaries) ===")
                 for mem in memories:
-                    topics = ", ".join(mem.get("topics", []))
-                    context_parts.append(
-                        f"[Score: {mem['score']:.2f}] {mem['content']}"
-                        + (f" (Topics: {topics})" if topics else "")
-                    )
+                    # Skip if it's an exchange (already included above)
+                    if mem.get("metadata", {}).get("type") != "conversation_exchange":
+                        topics = ", ".join(mem.get("topics", []))
+                        context_parts.append(
+                            f"[Score: {mem['score']:.2f}] {mem['content']}"
+                            + (f" (Topics: {topics})" if topics else "")
+                        )
         
         # Search indexed content
         if include_indexed_content:

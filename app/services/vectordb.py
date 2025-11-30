@@ -147,9 +147,15 @@ class VectorDBService:
         self._initialize()
         
         try:
+            logger.info(f"📝 Attempting to add document {doc_id} to collection {collection}")
+            logger.info(f"   Firebase available: {self._firebase_available}")
+            logger.info(f"   Content length: {len(content)} chars")
+            
             # Generate embedding if not provided
             if embedding is None:
+                logger.debug(f"   Generating embedding...")
                 embedding = await embedding_service.generate_embedding(content)
+                logger.debug(f"   Generated embedding of length {len(embedding)}")
             
             document = {
                 "id": doc_id,
@@ -162,19 +168,24 @@ class VectorDBService:
             
             if self._firebase_available:
                 collection_name = self._get_collection_name(collection)
+                logger.info(f"   Adding to Firebase collection: {collection_name}")
                 self.db.collection(collection_name).document(doc_id).set(document)
-                logger.debug(f"Added document {doc_id} to Firebase collection {collection_name}")
+                logger.info(f"✅ Successfully added document {doc_id} to Firebase collection {collection_name}")
             else:
                 # In-memory fallback
+                logger.warning(f"⚠️ Firebase not available - using in-memory store (data will be lost on restart)")
+                if not hasattr(self, '_in_memory_store'):
+                    self._in_memory_store = {}
                 if collection not in self._in_memory_store:
                     self._in_memory_store[collection] = {}
                 self._in_memory_store[collection][doc_id] = document
-                logger.debug(f"Added document {doc_id} to in-memory store")
+                total_docs = len(self._in_memory_store[collection])
+                logger.info(f"✅ Added document {doc_id} to in-memory store (collection: {collection}, total docs: {total_docs})")
             
             return True
             
         except Exception as e:
-            logger.error(f"Error adding document: {e}")
+            logger.error(f"❌ Error adding document {doc_id}: {e}", exc_info=True)
             return False
     
     async def update_document(

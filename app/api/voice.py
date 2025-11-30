@@ -47,21 +47,27 @@ CONSTRUCTION_FILES = {
 }
 
 
-async def get_github_context(query: str, vectordb_context: Optional[str] = None) -> Optional[str]:
+async def get_github_context(
+    query: str, 
+    vectordb_context: Optional[str] = None,
+    send_status_callback = None
+) -> tuple[Optional[str], dict]:
     """
-    Retrieve relevant GitHub file content based on query analysis.
+    Retrieve relevant GitHub file content using vector DB indexed content first.
     
     This function:
     1. Analyzes the query to determine which construction files are needed
-    2. Reads the relevant files directly from GitHub for fresh data
-    3. Formats the content for LLM consumption
+    2. FIRST checks vector DB for indexed GitHub content (semantic search)
+    3. Falls back to reading from GitHub if not found in vector DB or needs fresh data
+    4. Formats the content for LLM consumption
     
     Args:
         query: The user's query
         vectordb_context: Existing vector DB context (to check if we already have data)
+        send_status_callback: Optional callback to send status messages to UI
         
     Returns:
-        Formatted GitHub context string or None
+        Tuple of (formatted context string or None, metadata dict with source info)
     """
     query_lower = query.lower()
     files_to_read = []
@@ -72,7 +78,8 @@ async def get_github_context(query: str, vectordb_context: Optional[str] = None)
             files_to_read.append(CONSTRUCTION_FILES[category])
     
     # If query mentions specific things like "latest" or "current", prioritize fresh data
-    if any(word in query_lower for word in ["latest", "current", "now", "today", "recent"]):
+    needs_fresh_data = any(word in query_lower for word in ["latest", "current", "now", "today", "recent", "updated"])
+    if needs_fresh_data:
         # Add progress report for latest updates
         if "progress-report.md" not in files_to_read:
             files_to_read.append("progress-report.md")
@@ -82,40 +89,194 @@ async def get_github_context(query: str, vectordb_context: Optional[str] = None)
         files_to_read = ["project-overview.md", "progress-report.md"]
     
     if not files_to_read:
-        return None
+        return None, {}
     
-    # Read files from GitHub
     repo = settings.github_default_repo or "FlankaLanka/sample-jarvis-read-write-repo"
     context_parts = []
+    source_info = {
+        "from_vectordb": [],
+        "from_github": [],
+        "indexed_after_read": []
+    }
     
-    for file_path in files_to_read:
-        try:
-            file_content = github_service.get_file_content(repo, file_path)
-            if file_content:
-                # Format based on file type
-                if file_path.endswith(".json"):
-                    # Parse JSON for better readability
-                    try:
-                        data = json.loads(file_content.content)
-                        if file_path == "tasks.json":
-                            # Format tasks nicely
-                            formatted = format_tasks_for_context(data)
-                            context_parts.append(f"=== Construction Tasks ===\n{formatted}")
-                        else:
-                            context_parts.append(f"=== {file_path} ===\n{json.dumps(data, indent=2)}")
-                    except json.JSONDecodeError:
-                        context_parts.append(f"=== {file_path} ===\n{file_content.content}")
-                else:
-                    context_parts.append(f"=== {file_path} ===\n{file_content.content}")
+    # FIRST: Try to get content from vector DB (indexed GitHub files)
+    try:
+        if send_status_callback:
+            await send_status_callback({
+                "type": "system_message",
+                "message": "🔍 Searching vector DB for indexed GitHub content...",
+                "category": "vectordb"
+            })
+        
+        indexed_content = await memory_service.search_indexed_content(
+            query=query,
+            content_type="github_file",
+            repo=repo,
+            top_k=10
+        )
+        
+        # Check if we have indexed versions of the files we need
+        indexed_files = {}
+        for item in indexed_content:
+            path = item.get("path", "")
+            if path in files_to_read:
+                indexed_files[path] = item
+        
+        # Use indexed content if available and fresh (unless query needs latest data)
+        files_still_needed = []
+        for file_path in files_to_read:
+            if file_path in indexed_files and not needs_fresh_data:
+                # Use indexed version
+                item = indexed_files[file_path]
+                content = item.get("content", "")
+                indexed_at = item.get("indexed_at")
                 
-                logger.debug(f"Read GitHub file: {file_path}")
-        except Exception as e:
-            logger.warning(f"Could not read GitHub file {file_path}: {e}")
+                # Check freshness (if indexed_at is available)
+                is_fresh = True
+                if indexed_at:
+                    try:
+                        from datetime import datetime, timedelta
+                        indexed_time = datetime.fromisoformat(indexed_at.replace('Z', '+00:00'))
+                        if indexed_time.tzinfo:
+                            indexed_time = indexed_time.replace(tzinfo=None)
+                        age_hours = (datetime.utcnow() - indexed_time).total_seconds() / 3600
+                        is_fresh = age_hours < 24  # Consider fresh if < 24 hours old
+                    except Exception:
+                        pass
+                
+                if is_fresh:
+                    # Format based on file type
+                    if file_path.endswith(".json"):
+                        try:
+                            data = json.loads(content)
+                            if file_path == "tasks.json":
+                                formatted = format_tasks_for_context(data)
+                                context_parts.append(f"=== Construction Tasks ===\n{formatted}")
+                            else:
+                                context_parts.append(f"=== {file_path} ===\n{json.dumps(data, indent=2)}")
+                        except json.JSONDecodeError:
+                            context_parts.append(f"=== {file_path} ===\n{content}")
+                    else:
+                        context_parts.append(f"=== {file_path} ===\n{content}")
+                    
+                    source_info["from_vectordb"].append(file_path)
+                    logger.info(f"Using indexed content from vector DB for {file_path}")
+                    
+                    if send_status_callback:
+                        await send_status_callback({
+                            "type": "system_message",
+                            "message": f"✅ Found {file_path} in vector DB (indexed)",
+                            "category": "vectordb"
+                        })
+                else:
+                    # Indexed but stale, need fresh data
+                    files_still_needed.append(file_path)
+                    logger.debug(f"Indexed content for {file_path} is stale, will read from GitHub")
+            else:
+                # Not indexed or needs fresh data
+                files_still_needed.append(file_path)
+        
+        # Update files_to_read to only those we still need
+        files_to_read = files_still_needed
+        
+    except Exception as e:
+        logger.warning(f"Error checking vector DB for indexed content: {e}")
+        # Continue to read from GitHub as fallback
+    
+    # SECOND: Read remaining files directly from GitHub
+    if files_to_read:
+        if send_status_callback:
+            await send_status_callback({
+                "type": "system_message",
+                "message": f"📁 Reading {len(files_to_read)} file(s) from GitHub...",
+                "category": "github"
+            })
+        
+        logger.info(f"Reading {len(files_to_read)} file(s) from GitHub: {files_to_read}")
+        for file_path in files_to_read:
+            try:
+                file_content = github_service.get_file_content(repo, file_path)
+                if file_content:
+                    # Format based on file type
+                    if file_path.endswith(".json"):
+                        # Parse JSON for better readability
+                        try:
+                            data = json.loads(file_content.content)
+                            if file_path == "tasks.json":
+                                # Format tasks nicely
+                                formatted = format_tasks_for_context(data)
+                                context_parts.append(f"=== Construction Tasks ===\n{formatted}")
+                            else:
+                                context_parts.append(f"=== {file_path} ===\n{json.dumps(data, indent=2)}")
+                        except json.JSONDecodeError:
+                            context_parts.append(f"=== {file_path} ===\n{file_content.content}")
+                    else:
+                        context_parts.append(f"=== {file_path} ===\n{file_content.content}")
+                    
+                    source_info["from_github"].append(file_path)
+                    logger.debug(f"Read GitHub file: {file_path}")
+                    
+                    if send_status_callback:
+                        await send_status_callback({
+                            "type": "system_message",
+                            "message": f"✅ Read {file_path} from GitHub",
+                            "category": "github"
+                        })
+                    
+                    # Auto-index the file in vector DB for future use (async, non-blocking)
+                    async def index_file_async():
+                        try:
+                            from app.services.indexing import indexing_service
+                            await indexing_service.index_github_file(
+                                repo=repo,
+                                path=file_path,
+                                content=file_content.content,
+                                language="json" if file_path.endswith(".json") else "markdown"
+                            )
+                            source_info["indexed_after_read"].append(file_path)
+                            logger.info(f"✅ Auto-indexed {file_path} in vector DB for future use")
+                            
+                            if send_status_callback:
+                                await send_status_callback({
+                                    "type": "system_message",
+                                    "message": f"💾 Indexed {file_path} in vector DB",
+                                    "category": "vectordb"
+                                })
+                        except Exception as e:
+                            logger.warning(f"Failed to auto-index {file_path}: {e}")
+                    
+                    asyncio.create_task(index_file_async())
+                    
+            except Exception as e:
+                logger.warning(f"Could not read GitHub file {file_path}: {e}")
+                if send_status_callback:
+                    await send_status_callback({
+                        "type": "system_message",
+                        "message": f"⚠️ Failed to read {file_path} from GitHub",
+                        "category": "github"
+                    })
+    
+    # Build summary message for UI
+    if source_info["from_vectordb"] and source_info["from_github"]:
+        summary_msg = f"📊 Using {len(source_info['from_vectordb'])} file(s) from vector DB, {len(source_info['from_github'])} from GitHub"
+    elif source_info["from_vectordb"]:
+        summary_msg = f"✅ Using {len(source_info['from_vectordb'])} file(s) from vector DB (no GitHub read needed)"
+    elif source_info["from_github"]:
+        summary_msg = f"📁 Read {len(source_info['from_github'])} file(s) from GitHub"
+    else:
+        summary_msg = None
+    
+    if summary_msg and send_status_callback:
+        await send_status_callback({
+            "type": "system_message",
+            "message": summary_msg,
+            "category": "system"
+        })
     
     if context_parts:
-        return "\n\n".join(context_parts)
+        return "\n\n".join(context_parts), source_info
     
-    return None
+    return None, source_info
 
 
 def format_tasks_for_context(tasks_data: dict) -> str:
@@ -400,89 +561,99 @@ async def process_audio_chunk(websocket: WebSocket, session_id: str, audio_chunk
         # Get conversation history
         history = memory_service.get_history(session_id)
         
-        # Retrieve vector DB context (past conversations + indexed content)
+        # Smart routing: Determine query type
+        query_lower = text.lower()
+        is_project_query = any(word in query_lower for word in [
+            "project", "construction", "task", "tasks", "progress", "team", 
+            "status", "assignment", "assigned", "due date", "deadline"
+        ])
+        is_memory_query = any(word in query_lower for word in [
+            "remember", "we discussed", "last time", "before", "earlier", 
+            "previously", "you said", "told me", "mentioned"
+        ])
+        needs_fresh_data = any(word in query_lower for word in [
+            "latest", "current", "now", "today", "recent", "updated", "status"
+        ])
+        
+        # Retrieve vector DB context (for general queries and as context for project queries)
         vectordb_context = None
-        try:
-            # Send UI indicator for vector DB query
-            await send_response({
-                "type": "system_message",
-                "message": "🔍 Querying vector database...",
-                "category": "vectordb"
-            })
-            
-            vectordb_context = await memory_service.get_combined_context(
-                query=text,
-                session_id=session_id,
-                include_memories=True,
-                include_indexed_content=True,
-                user_id=user_id
-            )
-            if vectordb_context:
-                logger.info(f"Retrieved vector DB context ({len(vectordb_context)} chars) for query: '{text[:50]}...' (user_id: {user_id})")
-                await send_response({
-                    "type": "system_message",
-                    "message": "✅ Found relevant context in vector database",
-                    "category": "vectordb"
-                })
-            else:
-                logger.info(f"No vector DB context found for query: '{text[:50]}...' (user_id: {user_id})")
-                await send_response({
-                    "type": "system_message",
-                    "message": "ℹ️ No relevant context found in vector database",
-                    "category": "vectordb"
-                })
-        except Exception as e:
-            logger.warning(f"Could not retrieve vector DB context: {e}")
-            await send_response({
-                "type": "system_message",
-                "message": "⚠️ Vector database query failed",
-                "category": "vectordb"
-            })
+        use_vectordb = not is_project_query or is_memory_query  # Always use for general/memory queries
         
-        # Retrieve GitHub context for construction-related queries
-        # This reads fresh data directly from GitHub for real-time accuracy
+        if use_vectordb:
+            try:
+                await send_response({
+                    "type": "system_message",
+                    "message": "🔍 Searching memory...",
+                    "category": "vectordb"
+                })
+                
+                vectordb_context = await memory_service.get_combined_context(
+                    query=text,
+                    session_id=session_id,
+                    include_memories=True,
+                    include_indexed_content=not is_project_query,  # Don't search indexed content for project queries
+                    user_id=user_id
+                )
+                if vectordb_context:
+                    logger.info(f"Retrieved vector DB context ({len(vectordb_context)} chars) for query: '{text[:50]}...' (user_id: {user_id})")
+                    await send_response({
+                        "type": "system_message",
+                        "message": "✅ Found relevant context in memory",
+                        "category": "vectordb"
+                    })
+                else:
+                    logger.info(f"No vector DB context found for query: '{text[:50]}...' (user_id: {user_id})")
+            except Exception as e:
+                logger.warning(f"Could not retrieve vector DB context: {e}")
+        
+        # Retrieve GitHub context for project queries (source of truth)
+        # Uses vector DB indexed content first, then GitHub if needed
         github_context = None
-        try:
-            # Check if we might need GitHub data
-            if any(word in text.lower() for word in ["project", "construction", "task", "progress", "team", "status"]):
+        github_source_info = {}
+        if is_project_query:
+            try:
+                # get_github_context will send its own status messages via callback
+                github_context, github_source_info = await get_github_context(
+                    text, 
+                    vectordb_context,
+                    send_status_callback=send_response
+                )
+                if github_context:
+                    logger.debug(f"Retrieved GitHub context ({len(github_context)} chars)")
+                    # Summary message already sent by get_github_context
+                else:
+                    logger.debug("No GitHub context found for project query")
+            except Exception as e:
+                logger.warning(f"Could not retrieve GitHub context: {e}")
                 await send_response({
                     "type": "system_message",
-                    "message": "📁 Reading from GitHub repository...",
+                    "message": "⚠️ GitHub read failed",
                     "category": "github"
                 })
-            
-            github_context = await get_github_context(text, vectordb_context)
-            if github_context:
-                logger.debug(f"Retrieved GitHub context ({len(github_context)} chars)")
-                await send_response({
-                    "type": "system_message",
-                    "message": "✅ Retrieved data from GitHub",
-                    "category": "github"
-                })
-        except Exception as e:
-            logger.warning(f"Could not retrieve GitHub context: {e}")
-            await send_response({
-                "type": "system_message",
-                "message": "⚠️ GitHub read failed",
-                "category": "github"
-            })
         
-        # Combine contexts: GitHub context takes priority for fresh data
-        # Add capability awareness to context
+        # Combine contexts with smart priority
+        # For project queries: GitHub is source of truth, Vector DB provides context
+        # For general queries: Vector DB is primary source
         capability_info = """
 === CURRENT SYSTEM STATUS ===
-- Vector Database: Available (provides past conversation context and indexed content)
-- GitHub Repository: Available (provides real-time project data)
+- Vector Database: Available (provides past conversation context)
+- GitHub Repository: Available (provides real-time project data - SOURCE OF TRUTH for project queries)
 - Write Operations: Enabled (can update tasks, add progress notes)
 - Auto-Push: Enabled (all commits automatically pushed to remote)
 - Default Repository: {repo}
 
+=== DATA SOURCE PRIORITY ===
+- PROJECT QUERIES (tasks, progress, team): GitHub is SOURCE OF TRUTH, Vector DB provides historical context
+- GENERAL QUERIES (conversations, memories): Vector DB is primary source
+- MEMORY QUERIES (past discussions): Vector DB only
+
 === AVAILABLE OPERATIONS ===
 1. Read Operations:
-   - Query tasks.json for task information
-   - Read progress-report.md for latest updates
-   - Access project-overview.md for project details
-   - Search team-responsibilities.md for team info
+   - Query tasks.json for task information (from GitHub)
+   - Read progress-report.md for latest updates (from GitHub)
+   - Access project-overview.md for project details (from GitHub)
+   - Search team-responsibilities.md for team info (from GitHub)
+   - Access past conversations (from Vector DB)
 
 2. Write Operations:
    - Update task status/progress: "Update task TASK-001 to completed"
@@ -490,29 +661,31 @@ async def process_audio_chunk(websocket: WebSocket, session_id: str, audio_chunk
    - Add progress notes: "Add a note that foundation is complete"
    - All writes automatically commit and push
 
-3. Memory Operations:
-   - Access past conversation summaries
-   - Search indexed GitHub content semantically
-   - Combine historical context with fresh data
-
 === IMPORTANT REMINDERS ===
+- For project data: ALWAYS use GitHub as source of truth
+- For general questions: Use Vector DB for past conversations
 - Always confirm what you're about to change before executing writes
 - If task ID not found, list available tasks
 - If write fails, explain the error clearly
-- Use GitHub data for current/latest information
-- Use vector DB for historical context and past discussions
 """.format(repo=settings.github_default_repo or "FlankaLanka/sample-jarvis-read-write-repo")
         
         combined_context = None
-        if github_context and vectordb_context:
-            combined_context = f"{capability_info}\n\n=== FRESH DATA FROM GITHUB ===\n{github_context}\n\n=== HISTORICAL CONTEXT FROM VECTOR DB ===\n{vectordb_context}"
-        elif github_context:
-            combined_context = f"{capability_info}\n\n=== FRESH DATA FROM GITHUB ===\n{github_context}"
-        elif vectordb_context:
-            combined_context = f"{capability_info}\n\n=== HISTORICAL CONTEXT FROM VECTOR DB ===\n{vectordb_context}"
+        if is_project_query:
+            # Project queries: GitHub is source of truth, Vector DB provides context
+            if github_context and vectordb_context:
+                combined_context = f"{capability_info}\n\n=== SOURCE OF TRUTH: GITHUB DATA ===\n{github_context}\n\n=== HISTORICAL CONTEXT FROM MEMORY ===\n{vectordb_context}"
+            elif github_context:
+                combined_context = f"{capability_info}\n\n=== SOURCE OF TRUTH: GITHUB DATA ===\n{github_context}"
+            elif vectordb_context:
+                combined_context = f"{capability_info}\n\n=== HISTORICAL CONTEXT FROM MEMORY ===\n{vectordb_context}\n\nNote: GitHub data unavailable, using memory context"
+            else:
+                combined_context = capability_info
         else:
-            # Even without context, provide capability info
-            combined_context = capability_info
+            # General queries: Vector DB is primary
+            if vectordb_context:
+                combined_context = f"{capability_info}\n\n=== RELEVANT MEMORY ===\n{vectordb_context}"
+            else:
+                combined_context = capability_info
         
         # Send speaking status (we'll start speaking as soon as we have first sentence)
         await send_response({"type": "status", "status": "speaking"})
@@ -902,6 +1075,7 @@ async def process_audio_chunk(websocket: WebSocket, session_id: str, audio_chunk
         
         # Store complete response in memory (only if not interrupted and we have a response)
         if full_response.strip() and not was_interrupted:
+            # Add exchange to in-memory history
             memory_service.add_exchange(
                 session_id, 
                 text, 
@@ -910,33 +1084,50 @@ async def process_audio_chunk(websocket: WebSocket, session_id: str, audio_chunk
                 tool_results=tool_results_for_memory if tool_calls_to_execute else None
             )
             
-            # Auto-save conversation to vector DB with user_id filtering
-            # Check if this is a "remember" command or important information
-            is_remember_command = any(word in text.lower() for word in [
-                "remember", "save", "note that", "keep in mind", "don't forget",
-                "x equals", "x is", "x =", "equals", "is equal to"
-            ])
+            # Get the exchange we just added
+            last_exchange = memory_service.get_last_exchange(session_id)
+            history_length = len(memory_service.get_history(session_id))
             
-            # Auto-save if:
-            # 1. It's a remember command (force save immediately)
-            # 2. Or we've reached the threshold
-            try:
-                if is_remember_command:
-                    # Force save immediately for important information
-                    await memory_service.save_to_vectordb(session_id, user_id=user_id, force=True)
-                    logger.info(f"Auto-saved conversation due to remember command (user: {user_id})")
-                    await send_response({
-                        "type": "system_message",
-                        "message": "💾 Saved to memory",
-                        "category": "vectordb"
-                    })
-                elif len(memory_service.get_history(session_id)) >= settings.conversation_summary_threshold:
-                    # Auto-save when threshold is met
-                    await memory_service.save_to_vectordb(session_id, user_id=user_id, force=False)
-                    logger.info(f"Auto-saved conversation (threshold met, user: {user_id})")
-            except Exception as e:
-                logger.warning(f"Error auto-saving conversation: {e}")
-                # Don't fail the whole operation if save fails
+            # Save EVERY exchange immediately (async, non-blocking)
+            async def save_exchange_async():
+                try:
+                    if last_exchange:
+                        success = await memory_service.save_exchange_to_vectordb(
+                            session_id=session_id,
+                            exchange=last_exchange,
+                            user_id=user_id
+                        )
+                        if success:
+                            logger.debug(f"✅ Saved exchange {history_length} to vector DB")
+                        else:
+                            logger.warning(f"❌ Failed to save exchange {history_length}")
+                except Exception as e:
+                    logger.error(f"Error saving exchange: {e}")
+            
+            # Save exchange in background
+            asyncio.create_task(save_exchange_async())
+            
+            # Rotate exchanges asynchronously when we exceed the keep limit
+            # Keep 10 most recent as individual exchanges, summarize older ones
+            KEEP_RECENT_EXCHANGES = 10
+            
+            async def rotate_exchanges_async():
+                try:
+                    if history_length > KEEP_RECENT_EXCHANGES:
+                        # Only rotate every 5 exchanges to avoid too frequent operations
+                        if history_length % 5 == 0:
+                            logger.info(f"🔄 Rotating exchanges (history_length: {history_length})...")
+                            await memory_service.rotate_exchanges(
+                                session_id=session_id,
+                                user_id=user_id,
+                                keep_recent=KEEP_RECENT_EXCHANGES
+                            )
+                except Exception as e:
+                    logger.error(f"Error rotating exchanges: {e}")
+            
+            # Rotate in background (only when needed)
+            if history_length > KEEP_RECENT_EXCHANGES:
+                asyncio.create_task(rotate_exchanges_async())
             
             # Send complete response text
             await send_response({
@@ -1175,8 +1366,20 @@ async def get_vectordb_stats():
                 content = await vectordb_service.list_documents("indexed_content", limit=1000)
                 stats["conversation_summaries_count"] = len(summaries)
                 stats["indexed_content_count"] = len(content)
-            except Exception:
-                pass
+                
+                # Add sample document IDs for debugging
+                if summaries:
+                    stats["sample_summary_ids"] = [s.get("id", "unknown") for s in summaries[:5]]
+                if content:
+                    stats["sample_content_ids"] = [c.get("id", "unknown") for c in content[:5]]
+            except Exception as e:
+                logger.warning(f"Error getting document counts: {e}")
+                stats["error"] = str(e)
+        
+        # Add Firebase configuration status
+        stats["firebase_configured"] = bool(settings.firebase_credentials_path and settings.firebase_project_id)
+        stats["firebase_credentials_path"] = settings.firebase_credentials_path or "Not set"
+        stats["firebase_project_id"] = settings.firebase_project_id or "Not set"
         
         return {
             "status": "success",
